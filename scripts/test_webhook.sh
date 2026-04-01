@@ -32,6 +32,7 @@ from urllib import error, request
 
 url = sys.argv[1]
 hostname = sys.argv[2]
+timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 payload = {
     "username": "SSHook",
@@ -39,10 +40,10 @@ payload = {
         {
             "title": "Prueba de webhook SSHook",
             "color": 0x3498DB,
-            "description": f"Conectividad correcta con Discord para `{hostname}`.",
+            "description": f"✅ SSHook puede enviar alertas a Discord desde {hostname} a las {timestamp}.",
             "fields": [
                 {"name": "Servidor", "value": hostname, "inline": True},
-                {"name": "Hora", "value": datetime.now(UTC).isoformat(), "inline": True},
+                {"name": "Hora", "value": timestamp, "inline": True},
                 {"name": "Estado", "value": "ok", "inline": True},
             ],
             "footer": {"text": "SSHook | webhook test"},
