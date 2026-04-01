@@ -1,0 +1,16 @@
+[Unit]
+Description=SSHook - SSH alerts to Discord webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sshook
+EnvironmentFile=/opt/sshook/.env
+ExecStart=/usr/bin/env python3 /opt/sshook/app/main.py --daemon --env-file /opt/sshook/.env
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
