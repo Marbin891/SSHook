@@ -262,14 +262,19 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
     timestamp = datetime.now(UTC)
     hostname = settings.hostname_alias
     message = raw_line
+    process_name = ""
 
     prefix_match = ISO_PREFIX_RE.match(raw_line) or SYSLOG_PREFIX_RE.match(raw_line)
     if prefix_match:
         timestamp = parse_timestamp(prefix_match.group("timestamp"))
         hostname = settings.hostname_alias or prefix_match.group("hostname")
         message = prefix_match.group("message")
+        process_name = prefix_match.group("process").lower()
 
-    if "sshd" not in message.lower() and "session closed for user" not in message.lower():
+    # Tras extraer el prefijo syslog/journald, el texto del mensaje ya no incluye
+    # necesariamente la cadena "sshd". Filtramos por proceso cuando está disponible
+    # para no perder eventos Accepted/Failed.
+    if process_name and "sshd" not in process_name and "sshd-session" not in process_name:
         return None
 
     accepted = ACCEPTED_RE.search(message)
