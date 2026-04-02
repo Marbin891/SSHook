@@ -42,6 +42,9 @@ RECEIVED_DISCONNECT_RE = re.compile(
     r"Received disconnect from (?P<ip>\S+)\s+port\s+\d+",
     re.IGNORECASE,
 )
+UNKNOWN_VALUE = "unknown"
+SESSION_CACHE_TTL = 43200
+LOGOUT_DEDUPE_WINDOW_SECONDS = 5
 
 
 @dataclass(slots=True)
@@ -87,6 +90,64 @@ class BasicRateLimiter:
 
         queue.append(current)
         return True
+
+
+class SessionTracker:
+    def __init__(self, ttl_seconds: int = SESSION_CACHE_TTL):
+        self.ttl_seconds = ttl_seconds
+        self.by_user: dict[str, tuple[str, float]] = {}
+        self.by_ip: dict[str, tuple[str, float]] = {}
+
+    def prune(self, now: float) -> None:
+        expired_users = [user for user, (_, ts) in self.by_user.items() if now - ts > self.ttl_seconds]
+        for user in expired_users:
+            self.by_user.pop(user, None)
+
+        expired_ips = [ip for ip, (_, ts) in self.by_ip.items() if now - ts > self.ttl_seconds]
+        for ip in expired_ips:
+            self.by_ip.pop(ip, None)
+
+    def remember_login(self, username: str, ip: str, now: float) -> None:
+        if username and username != UNKNOWN_VALUE and ip and ip != UNKNOWN_VALUE:
+            self.by_user[username.lower()] = (ip, now)
+            self.by_ip[ip] = (username, now)
+        self.prune(now)
+
+    def enrich_logout(self, event: SSHEvent, now: float) -> SSHEvent:
+        self.prune(now)
+
+        username = event.username
+        source_ip = event.source_ip
+
+        if username != UNKNOWN_VALUE and source_ip == UNKNOWN_VALUE:
+            remembered = self.by_user.get(username.lower())
+            if remembered is not None:
+                source_ip = remembered[0]
+
+        if source_ip != UNKNOWN_VALUE and username == UNKNOWN_VALUE:
+            remembered = self.by_ip.get(source_ip)
+            if remembered is not None:
+                username = remembered[0]
+
+        if username == event.username and source_ip == event.source_ip:
+            return event
+
+        return SSHEvent(
+            event_type=event.event_type,
+            severity=event.severity,
+            timestamp=event.timestamp,
+            hostname=event.hostname,
+            username=username,
+            source_ip=source_ip,
+            raw_message=event.raw_message,
+            source_name=event.source_name,
+        )
+
+    def forget_logout(self, event: SSHEvent) -> None:
+        if event.username != UNKNOWN_VALUE:
+            self.by_user.pop(event.username.lower(), None)
+        if event.source_ip != UNKNOWN_VALUE:
+            self.by_ip.pop(event.source_ip, None)
 
 
 class LogSource:
@@ -271,9 +332,6 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
         message = prefix_match.group("message")
         process_name = prefix_match.group("process").lower()
 
-    # Tras extraer el prefijo syslog/journald, el texto del mensaje ya no incluye
-    # necesariamente la cadena "sshd". Filtramos por proceso cuando está disponible
-    # para no perder eventos Accepted/Failed.
     if process_name and "sshd" not in process_name and "sshd-session" not in process_name:
         return None
 
@@ -303,19 +361,6 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
             source_name=source_name,
         )
 
-    session_closed = SESSION_CLOSED_RE.search(message)
-    if session_closed:
-        return SSHEvent(
-            event_type="logout",
-            severity="medium",
-            timestamp=timestamp,
-            hostname=hostname,
-            username=session_closed.group("username"),
-            source_ip="unknown",
-            raw_message=raw_line,
-            source_name=source_name,
-        )
-
     disconnected = DISCONNECTED_RE.search(message)
     if disconnected:
         return SSHEvent(
@@ -329,6 +374,19 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
             source_name=source_name,
         )
 
+    session_closed = SESSION_CLOSED_RE.search(message)
+    if session_closed:
+        return SSHEvent(
+            event_type="logout",
+            severity="medium",
+            timestamp=timestamp,
+            hostname=hostname,
+            username=session_closed.group("username"),
+            source_ip=UNKNOWN_VALUE,
+            raw_message=raw_line,
+            source_name=source_name,
+        )
+
     received_disconnect = RECEIVED_DISCONNECT_RE.search(message)
     if received_disconnect:
         return SSHEvent(
@@ -336,7 +394,7 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
             severity="medium",
             timestamp=timestamp,
             hostname=hostname,
-            username="unknown",
+            username=UNKNOWN_VALUE,
             source_ip=received_disconnect.group("ip"),
             raw_message=raw_line,
             source_name=source_name,
@@ -369,6 +427,7 @@ class SSHWatcher:
             settings.ssh_rate_limit_window,
             settings.ssh_rate_limit_burst,
         )
+        self.session_tracker = SessionTracker()
 
     def should_ignore(self, event: SSHEvent) -> bool:
         if event.source_ip.lower() in self.settings.ssh_ignore_ips:
@@ -390,12 +449,47 @@ class SSHWatcher:
         self.notifier.send_event(event)
         self.logger.info("Notificación enviada %s", summary)
 
+    def normalized_fingerprint(self, event: SSHEvent) -> str:
+        if event.event_type != "logout":
+            return event.fingerprint()
+
+        timestamp_bucket = int(event.timestamp.timestamp() // LOGOUT_DEDUPE_WINDOW_SECONDS)
+        base = "|".join(
+            [
+                event.event_type,
+                event.hostname,
+                event.username,
+                event.source_ip,
+                str(timestamp_bucket),
+            ]
+        )
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+    def prepare_event(self, event: SSHEvent, now: float) -> SSHEvent:
+        if event.event_type == "login_success":
+            self.session_tracker.remember_login(event.username, event.source_ip, now)
+            return event
+
+        if event.event_type == "logout":
+            enriched = self.session_tracker.enrich_logout(event, now)
+            return enriched
+
+        return event
+
+    def finalize_event(self, event: SSHEvent) -> None:
+        if event.event_type == "logout":
+            self.session_tracker.forget_logout(event)
+
     def process_lines(self, lines: list[str]) -> int:
         processed = 0
         for line in lines:
             event = parse_ssh_event(line, self.settings, self.source.describe())
             if event is None:
                 continue
+
+            now = time.time()
+            event = self.prepare_event(event, now)
+
             if self.should_ignore(event):
                 self.logger.debug(
                     "Evento ignorado por whitelist: user=%s ip=%s",
@@ -404,8 +498,7 @@ class SSHWatcher:
                 )
                 continue
 
-            fingerprint = event.fingerprint()
-            now = time.time()
+            fingerprint = self.normalized_fingerprint(event)
             if self.state_store.seen_recently(fingerprint, self.settings.dedupe_ttl, now):
                 self.logger.debug("Evento duplicado suprimido: %s", fingerprint)
                 continue
@@ -417,6 +510,7 @@ class SSHWatcher:
 
             self.emit(event)
             self.state_store.mark_seen(fingerprint, now)
+            self.finalize_event(event)
             processed += 1
 
         if processed:
