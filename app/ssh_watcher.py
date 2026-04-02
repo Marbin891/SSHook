@@ -477,8 +477,11 @@ class SSHWatcher:
         return event
 
     def finalize_event(self, event: SSHEvent) -> None:
-        if event.event_type == "logout":
-            self.session_tracker.forget_logout(event)
+        # No eliminamos la correlación al primer logout porque sshd/pam puede
+        # emitir más de una línea de cierre para la misma sesión en el mismo
+        # segundo. Dejamos que expire por TTL y que la deduplicación suprima
+        # los duplicados.
+        return None
 
     def process_lines(self, lines: list[str]) -> int:
         processed = 0
