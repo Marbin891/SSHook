@@ -3,6 +3,7 @@ set -euo pipefail
 
 INSTALL_DIR="/opt/sshook"
 SERVICE_TARGET="/etc/systemd/system/sshook.service"
+SERVICE_DROPIN_DIR="/etc/systemd/system/sshook.service.d"
 PURGE_STATE=false
 
 usage() {
@@ -51,6 +52,7 @@ main() {
   fi
 
   rm -f "$SERVICE_TARGET"
+  rm -rf "$SERVICE_DROPIN_DIR"
   rm -rf "$INSTALL_DIR"
 
   if [[ "$PURGE_STATE" == true ]]; then

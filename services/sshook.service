@@ -5,12 +5,31 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=sshook
+Group=sshook
 WorkingDirectory=/opt/sshook
 EnvironmentFile=/opt/sshook/.env
 ExecStart=/usr/bin/env python3 /opt/sshook/app/main.py --daemon --env-file /opt/sshook/.env
 Restart=always
 RestartSec=5
+UMask=0077
+StateDirectory=sshook
+LogsDirectory=sshook
 NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

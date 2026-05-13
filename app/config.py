@@ -4,11 +4,13 @@ import os
 import socket
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 DEFAULT_ENV_FILE = Path(".env")
 DEFAULT_AUTH_LOG = Path("/var/log/auth.log")
 DEFAULT_SECURE_LOG = Path("/var/log/secure")
+DISCORD_WEBHOOK_HOSTS = frozenset({"discord.com", "discordapp.com"})
 
 
 class ConfigError(ValueError):
@@ -81,6 +83,19 @@ def _resolve_env_file(env_file: str | None) -> Path:
     return DEFAULT_ENV_FILE.resolve()
 
 
+def validate_discord_webhook_url(webhook_url: str) -> None:
+    parsed = urlparse(webhook_url)
+    hostname = (parsed.hostname or "").lower()
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    if parsed.scheme != "https":
+        raise ConfigError("DISCORD_WEBHOOK_URL debe usar HTTPS.")
+    if hostname not in DISCORD_WEBHOOK_HOSTS:
+        raise ConfigError("DISCORD_WEBHOOK_URL debe apuntar a discord.com.")
+    if len(path_parts) < 4 or path_parts[:2] != ["api", "webhooks"]:
+        raise ConfigError("DISCORD_WEBHOOK_URL debe ser una URL de webhook de Discord.")
+
+
 def load_settings(env_file: str | None = None, *, require_webhook: bool = True) -> Settings:
     resolved_env_file = _resolve_env_file(env_file)
     env_values = load_env_file(resolved_env_file)
@@ -90,6 +105,8 @@ def load_settings(env_file: str | None = None, *, require_webhook: bool = True) 
         raise ConfigError(
             f"DISCORD_WEBHOOK_URL no está configurado. Archivo esperado: {resolved_env_file}"
         )
+    if discord_webhook_url:
+        validate_discord_webhook_url(discord_webhook_url)
 
     hostname_alias = _get_env_value("HOSTNAME_ALIAS", env_values, "").strip() or socket.gethostname()
     ssh_log_mode = _get_env_value("SSH_LOG_MODE", env_values, "auto").strip().lower()

@@ -69,7 +69,7 @@ class SSHEvent:
                 self.source_name,
             ]
         )
-        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
 class BasicRateLimiter:
@@ -463,7 +463,7 @@ class SSHWatcher:
                 str(timestamp_bucket),
             ]
         )
-        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     def prepare_event(self, event: SSHEvent, now: float) -> SSHEvent:
         if event.event_type == "login_success":

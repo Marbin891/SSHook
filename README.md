@@ -58,7 +58,7 @@ Después edita `.env` y ajusta lo necesario.
 
 Variables principales:
 
-- `DISCORD_WEBHOOK_URL`: URL del webhook de Discord.
+- `DISCORD_WEBHOOK_URL`: URL HTTPS del webhook de Discord, con formato `https://discord.com/api/webhooks/...`.
 - `HOSTNAME_ALIAS`: nombre que aparecerá en las alertas. Si se deja vacío, se usa el hostname del sistema.
 - `SSH_LOG_MODE`: `auto`, `journald`, `authlog`, `secure` o `file`.
 - `SSH_JOURNAL_UNIT`: units opcionales para filtrar `journalctl`, separadas por comas.
@@ -71,6 +71,8 @@ Variables principales:
 - `STATE_DIR`: directorio para estado persistente.
 - `LOG_DIR`: directorio para logs de la aplicación.
 - `LOG_LEVEL`: `DEBUG`, `INFO`, `WARNING` o `ERROR`.
+
+Durante la instalación con `sudo ./scripts/install.sh`, `STATE_DIR` debe estar dentro de `/var/lib/sshook` y `LOG_DIR` dentro de `/var/log/sshook`. Esta restricción evita que un `.env` manipulado provoque cambios de permisos sobre rutas sensibles del sistema.
 
 El archivo de ejemplo está en [config/.env.example](/config/projects/ssh-dscrd/config/.env.example).
 
@@ -87,6 +89,9 @@ El instalador:
 - copia el proyecto a `/opt/sshook`
 - instala la unidad en `/etc/systemd/system/sshook.service`
 - crea los directorios definidos en `STATE_DIR` y `LOG_DIR`
+- crea un drop-in de systemd para permitir escritura solo en `STATE_DIR` y `LOG_DIR`
+- crea un usuario de sistema `sshook` para ejecutar el servicio sin privilegios root
+- deja `/opt/sshook/.env` con permisos restrictivos para root y el grupo `sshook`
 
 Después habilita y arranca el servicio:
 
@@ -182,8 +187,9 @@ Healthcheck básico:
 
 ### Problemas de permisos al leer logs
 
-- en muchos sistemas lo más simple es ejecutar el servicio como `root`
-- si cambias el usuario del servicio, asegúrate de que pueda leer `journald` o los archivos de autenticación del sistema
+- el instalador agrega el usuario `sshook` a los grupos `adm` y `systemd-journal` si existen
+- si tu distribución usa otro grupo para leer logs de autenticación, agrega `sshook` a ese grupo y reinicia el servicio
+- si necesitas rutas fuera de `/var/lib/sshook` o `/var/log/sshook`, revisa manualmente el drop-in de systemd antes de relajar esa restricción
 
 ### Rotación de logs
 
@@ -195,6 +201,7 @@ SSHook guarda inode y offset. Si el archivo rota o se trunca, reinicia la lectur
 - mantén permisos restrictivos sobre el archivo de configuración
 - usa `SSH_IGNORE_IPS` y `SSH_IGNORE_USERS` para reducir ruido innecesario
 - el rate limiting evita tormentas de alertas repetidas, pero no sustituye medidas de seguridad SSH
+- el servicio systemd incluido usa un usuario dedicado y restricciones como `NoNewPrivileges`, `ProtectSystem` y `ProtectHome`
 
 ## Estructura del proyecto
 

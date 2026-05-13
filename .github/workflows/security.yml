@@ -1,0 +1,74 @@
+name: Security
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests and static guards
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.x"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+
+      - name: Check shell syntax
+        run: bash -n scripts/*.sh
+
+      - name: Run ShellCheck when available
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/*.sh
+          fi
+
+      - name: Block weak SHA1 usage
+        run: |
+          if grep -R -n "hashlib\.sha1" app; then
+            echo "hashlib.sha1 is not allowed for SSH event fingerprints" >&2
+            exit 1
+          fi
+
+      - name: Block obvious committed secrets
+        run: |
+          if grep -R -n -E '(discord(app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_.-]+|ghp_|github_pat_|xox[baprs]-|AKIA[0-9A-Z]{16}|-----BEGIN .*PRIVATE KEY-----|sk-[A-Za-z0-9]{20,})' . \
+            --exclude-dir=.git \
+            --exclude-dir=__pycache__ \
+            --exclude='security.yml'; then
+            echo "Potential secret committed to repository" >&2
+            exit 1
+          fi
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3

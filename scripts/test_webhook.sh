@@ -14,24 +14,40 @@ command -v python3 >/dev/null 2>&1 || {
   exit 1
 }
 
-set -a
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
-
-if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then
-  echo "DISCORD_WEBHOOK_URL no está configurado en $ENV_FILE" >&2
-  exit 1
-fi
-
-python3 - "$DISCORD_WEBHOOK_URL" "${HOSTNAME_ALIAS:-$(hostname)}" <<'PY'
+python3 - "$ENV_FILE" "$(hostname)" <<'PY'
 import json
+import os
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from urllib import error, request
 
-url = sys.argv[1]
-hostname = sys.argv[2]
+env_file = Path(sys.argv[1])
+default_hostname = sys.argv[2]
+
+
+def load_env_file(path):
+    parsed = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        parsed[key.strip()] = value.strip().strip('"').strip("'")
+    return parsed
+
+
+env_values = load_env_file(env_file)
+url = os.environ.get("DISCORD_WEBHOOK_URL", env_values.get("DISCORD_WEBHOOK_URL", "")).strip()
+hostname = (
+    os.environ.get("HOSTNAME_ALIAS", env_values.get("HOSTNAME_ALIAS", "")).strip()
+    or default_hostname
+)
+
+if not url:
+    print(f"DISCORD_WEBHOOK_URL no está configurado en {env_file}", file=sys.stderr)
+    raise SystemExit(1)
+
 timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 payload = {
