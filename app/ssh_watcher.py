@@ -75,6 +75,14 @@ class SSHEvent:
         return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
+@dataclass(slots=True)
+class SessionInfo:
+    username: str
+    source_ip: str
+    source_port: str
+    timestamp: float
+
+
 class BasicRateLimiter:
     def __init__(self, window_seconds: int, burst: int):
         self.window_seconds = window_seconds
@@ -98,22 +106,49 @@ class BasicRateLimiter:
 class SessionTracker:
     def __init__(self, ttl_seconds: int = SESSION_CACHE_TTL):
         self.ttl_seconds = ttl_seconds
-        self.by_user: dict[str, tuple[str, float]] = {}
-        self.by_ip: dict[str, tuple[str, float]] = {}
+        self.by_user: dict[str, SessionInfo] = {}
+        self.by_ip: dict[str, SessionInfo] = {}
+        self.by_process: dict[str, SessionInfo] = {}
 
     def prune(self, now: float) -> None:
-        expired_users = [user for user, (_, ts) in self.by_user.items() if now - ts > self.ttl_seconds]
+        expired_users = [
+            user for user, session in self.by_user.items()
+            if now - session.timestamp > self.ttl_seconds
+        ]
         for user in expired_users:
             self.by_user.pop(user, None)
 
-        expired_ips = [ip for ip, (_, ts) in self.by_ip.items() if now - ts > self.ttl_seconds]
+        expired_ips = [
+            ip for ip, session in self.by_ip.items()
+            if now - session.timestamp > self.ttl_seconds
+        ]
         for ip in expired_ips:
             self.by_ip.pop(ip, None)
 
-    def remember_login(self, username: str, ip: str, now: float) -> None:
-        if username and username != UNKNOWN_VALUE and ip and ip != UNKNOWN_VALUE:
-            self.by_user[username.lower()] = (ip, now)
-            self.by_ip[ip] = (username, now)
+        expired_processes = [
+            process_id for process_id, session in self.by_process.items()
+            if now - session.timestamp > self.ttl_seconds
+        ]
+        for process_id in expired_processes:
+            self.by_process.pop(process_id, None)
+
+    def remember_login(self, event: SSHEvent, now: float) -> None:
+        if (
+            event.username
+            and event.username != UNKNOWN_VALUE
+            and event.source_ip
+            and event.source_ip != UNKNOWN_VALUE
+        ):
+            session = SessionInfo(
+                username=event.username,
+                source_ip=event.source_ip,
+                source_port=event.source_port,
+                timestamp=now,
+            )
+            self.by_user[event.username.lower()] = session
+            self.by_ip[event.source_ip] = session
+            if event.process_id:
+                self.by_process[event.process_id] = session
         self.prune(now)
 
     def enrich_logout(self, event: SSHEvent, now: float) -> SSHEvent:
@@ -121,18 +156,31 @@ class SessionTracker:
 
         username = event.username
         source_ip = event.source_ip
+        source_port = event.source_port
 
-        if username != UNKNOWN_VALUE and source_ip == UNKNOWN_VALUE:
+        remembered: SessionInfo | None = None
+        if event.process_id:
+            remembered = self.by_process.get(event.process_id)
+
+        if remembered is None and username != UNKNOWN_VALUE:
             remembered = self.by_user.get(username.lower())
-            if remembered is not None:
-                source_ip = remembered[0]
 
-        if source_ip != UNKNOWN_VALUE and username == UNKNOWN_VALUE:
+        if remembered is None and source_ip != UNKNOWN_VALUE:
             remembered = self.by_ip.get(source_ip)
-            if remembered is not None:
-                username = remembered[0]
 
-        if username == event.username and source_ip == event.source_ip:
+        if remembered is not None:
+            if username == UNKNOWN_VALUE:
+                username = remembered.username
+            if source_ip == UNKNOWN_VALUE:
+                source_ip = remembered.source_ip
+            if not source_port:
+                source_port = remembered.source_port
+
+        if (
+            username == event.username
+            and source_ip == event.source_ip
+            and source_port == event.source_port
+        ):
             return event
 
         return SSHEvent(
@@ -144,6 +192,8 @@ class SessionTracker:
             source_ip=source_ip,
             raw_message=event.raw_message,
             source_name=event.source_name,
+            process_id=event.process_id,
+            source_port=source_port,
         )
 
     def forget_logout(self, event: SSHEvent) -> None:
@@ -687,7 +737,7 @@ class SSHWatcher:
 
     def prepare_event(self, event: SSHEvent, now: float) -> SSHEvent:
         if event.event_type == "login_success":
-            self.session_tracker.remember_login(event.username, event.source_ip, now)
+            self.session_tracker.remember_login(event, now)
             return event
 
         if event.event_type == "logout":

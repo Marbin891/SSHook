@@ -184,6 +184,38 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertEqual(second_processed, 0)
         self.assertEqual(len(notifier.events), 1)
 
+    def test_session_closed_reuses_login_port_for_dedupe(self) -> None:
+        watcher, notifier = self.make_watcher()
+
+        login_processed = watcher.process_lines(
+            [
+                (
+                    "2026-05-14T10:56:29 casa-jrz-01 sshd[456]: "
+                    "Accepted publickey for pelofeo from 192.168.60.2 port 55320 ssh2"
+                )
+            ]
+        )
+        logout_processed = watcher.process_lines(
+            [
+                (
+                    "2026-05-14T10:56:44 casa-jrz-01 sshd[456]: "
+                    "Disconnected from user pelofeo 192.168.60.2 port 55320"
+                ),
+                (
+                    "2026-05-14T10:56:44 casa-jrz-01 sshd[456]: "
+                    "pam_unix(sshd:session): session closed for user pelofeo"
+                ),
+            ]
+        )
+
+        self.assertEqual(login_processed, 1)
+        self.assertEqual(logout_processed, 1)
+        self.assertEqual(len(notifier.events), 2)
+        self.assertEqual(notifier.events[1].event_type, "logout")
+        self.assertEqual(notifier.events[1].username, "pelofeo")
+        self.assertEqual(notifier.events[1].source_ip, "192.168.60.2")
+        self.assertEqual(notifier.events[1].source_port, "55320")
+
 
 class _FakeNotifier:
     def __init__(self) -> None:
