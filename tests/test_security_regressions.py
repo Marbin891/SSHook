@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -8,7 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import ConfigError, load_env_file, load_settings
-from app.ssh_watcher import SSHEvent
+from app.ssh_watcher import SSHEvent, SSHWatcher
+from app.state_store import JSONStateStore
 
 
 ENV_KEYS = (
@@ -49,6 +51,39 @@ class SecurityRegressionTests(unittest.TestCase):
         with handle:
             handle.write(content)
         return Path(handle.name)
+
+    def make_watcher(self) -> tuple[SSHWatcher, "_FakeNotifier"]:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        base_path = Path(temp_dir.name)
+        input_file = base_path / "auth.log"
+        input_file.write_text("", encoding="utf-8")
+        env_file = self.write_env(
+            "\n".join(
+                [
+                    "HOSTNAME_ALIAS=casa-jrz-01",
+                    f"STATE_DIR={base_path / 'state'}",
+                    f"LOG_DIR={base_path / 'log'}",
+                    "SSH_RATE_LIMIT_WINDOW=60",
+                    "SSH_RATE_LIMIT_BURST=10",
+                ]
+            )
+        )
+
+        with clean_env():
+            settings = load_settings(str(env_file), require_webhook=False)
+
+        state_store = JSONStateStore(settings.state_dir)
+        state_store.load()
+        notifier = _FakeNotifier()
+        watcher = SSHWatcher(
+            settings,
+            logging.getLogger("sshook.tests"),
+            state_store,
+            notifier,
+            input_file=str(input_file),
+        )
+        return watcher, notifier
 
     def test_discord_webhook_must_use_https(self) -> None:
         env_file = self.write_env(
@@ -99,6 +134,63 @@ class SecurityRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual(len(event.fingerprint()), 64)
+
+    def test_logout_lines_from_one_session_are_coalesced(self) -> None:
+        watcher, notifier = self.make_watcher()
+
+        processed = watcher.process_lines(
+            [
+                (
+                    "2026-05-14T10:32:47 casa-jrz-01 sshd-session[123]: "
+                    "Received disconnect from 192.168.60.2 port 55320:11: disconnected by user"
+                ),
+                (
+                    "2026-05-14T10:32:47 casa-jrz-01 sshd-session[123]: "
+                    "Disconnected from user pelofeo 192.168.60.2 port 55320"
+                ),
+                (
+                    "2026-05-14T10:32:47 casa-jrz-01 sshd-session[123]: "
+                    "pam_unix(sshd:session): session closed for user pelofeo"
+                ),
+            ]
+        )
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(len(notifier.events), 1)
+        self.assertEqual(notifier.events[0].username, "pelofeo")
+        self.assertEqual(notifier.events[0].source_ip, "192.168.60.2")
+
+    def test_logout_partial_line_is_suppressed_after_full_logout(self) -> None:
+        watcher, notifier = self.make_watcher()
+
+        first_processed = watcher.process_lines(
+            [
+                (
+                    "2026-05-14T10:32:47 casa-jrz-01 sshd: "
+                    "Disconnected from user pelofeo 192.168.60.2 port 55320"
+                )
+            ]
+        )
+        second_processed = watcher.process_lines(
+            [
+                (
+                    "2026-05-14T10:32:47 casa-jrz-01 sshd: "
+                    "pam_unix(sshd:session): session closed for user pelofeo"
+                )
+            ]
+        )
+
+        self.assertEqual(first_processed, 1)
+        self.assertEqual(second_processed, 0)
+        self.assertEqual(len(notifier.events), 1)
+
+
+class _FakeNotifier:
+    def __init__(self) -> None:
+        self.events: list[SSHEvent] = []
+
+    def send_event(self, event: SSHEvent) -> None:
+        self.events.append(event)
 
 
 if __name__ == "__main__":

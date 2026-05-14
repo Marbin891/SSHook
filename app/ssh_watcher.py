@@ -23,11 +23,11 @@ ISO_PREFIX_RE = re.compile(
     r"(?P<hostname>\S+)\s+(?P<process>[^:]+):\s+(?P<message>.+)$"
 )
 ACCEPTED_RE = re.compile(
-    r"Accepted\s+\S+\s+for\s+(?P<username>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+\d+",
+    r"Accepted\s+\S+\s+for\s+(?P<username>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)",
     re.IGNORECASE,
 )
 FAILED_RE = re.compile(
-    r"Failed password for (?:invalid user )?(?P<username>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+\d+",
+    r"Failed password for (?:invalid user )?(?P<username>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)",
     re.IGNORECASE,
 )
 SESSION_CLOSED_RE = re.compile(
@@ -35,13 +35,14 @@ SESSION_CLOSED_RE = re.compile(
     re.IGNORECASE,
 )
 DISCONNECTED_RE = re.compile(
-    r"Disconnected from user (?P<username>\S+)\s+(?P<ip>\S+)\s+port\s+\d+",
+    r"Disconnected from user (?P<username>\S+)\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)",
     re.IGNORECASE,
 )
 RECEIVED_DISCONNECT_RE = re.compile(
-    r"Received disconnect from (?P<ip>\S+)\s+port\s+\d+",
+    r"Received disconnect from (?P<ip>\S+)\s+port\s+(?P<port>\d+)",
     re.IGNORECASE,
 )
+PROCESS_ID_RE = re.compile(r"\[(?P<pid>\d+)\]")
 UNKNOWN_VALUE = "unknown"
 SESSION_CACHE_TTL = 43200
 LOGOUT_DEDUPE_WINDOW_SECONDS = 5
@@ -57,6 +58,8 @@ class SSHEvent:
     source_ip: str
     raw_message: str
     source_name: str
+    process_id: str = ""
+    source_port: str = ""
 
     def fingerprint(self) -> str:
         base = "|".join(
@@ -324,6 +327,7 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
     hostname = settings.hostname_alias
     message = raw_line
     process_name = ""
+    process_id = ""
 
     prefix_match = ISO_PREFIX_RE.match(raw_line) or SYSLOG_PREFIX_RE.match(raw_line)
     if prefix_match:
@@ -331,6 +335,9 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
         hostname = settings.hostname_alias or prefix_match.group("hostname")
         message = prefix_match.group("message")
         process_name = prefix_match.group("process").lower()
+        process_id_match = PROCESS_ID_RE.search(process_name)
+        if process_id_match:
+            process_id = process_id_match.group("pid")
 
     if process_name and "sshd" not in process_name and "sshd-session" not in process_name:
         return None
@@ -346,6 +353,8 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
             source_ip=accepted.group("ip"),
             raw_message=raw_line,
             source_name=source_name,
+            process_id=process_id,
+            source_port=accepted.group("port"),
         )
 
     failed = FAILED_RE.search(message)
@@ -359,6 +368,8 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
             source_ip=failed.group("ip"),
             raw_message=raw_line,
             source_name=source_name,
+            process_id=process_id,
+            source_port=failed.group("port"),
         )
 
     disconnected = DISCONNECTED_RE.search(message)
@@ -372,6 +383,8 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
             source_ip=disconnected.group("ip"),
             raw_message=raw_line,
             source_name=source_name,
+            process_id=process_id,
+            source_port=disconnected.group("port"),
         )
 
     session_closed = SESSION_CLOSED_RE.search(message)
@@ -385,6 +398,7 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
             source_ip=UNKNOWN_VALUE,
             raw_message=raw_line,
             source_name=source_name,
+            process_id=process_id,
         )
 
     received_disconnect = RECEIVED_DISCONNECT_RE.search(message)
@@ -398,6 +412,8 @@ def parse_ssh_event(line: str, settings: Settings, source_name: str) -> SSHEvent
             source_ip=received_disconnect.group("ip"),
             raw_message=raw_line,
             source_name=source_name,
+            process_id=process_id,
+            source_port=received_disconnect.group("port"),
         )
 
     return None
@@ -453,17 +469,221 @@ class SSHWatcher:
         if event.event_type != "logout":
             return event.fingerprint()
 
-        timestamp_bucket = int(event.timestamp.timestamp() // LOGOUT_DEDUPE_WINDOW_SECONDS)
+        timestamp_bucket = self.logout_timestamp_bucket(event)
         base = "|".join(
             [
                 event.event_type,
                 event.hostname,
                 event.username,
                 event.source_ip,
-                str(timestamp_bucket),
+                event.source_port,
+                timestamp_bucket,
             ]
         )
         return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+    def logout_timestamp_bucket(self, event: SSHEvent) -> str:
+        return str(int(event.timestamp.timestamp() // LOGOUT_DEDUPE_WINDOW_SECONDS))
+
+    def logout_alias_fingerprint(self, event: SSHEvent, alias_type: str, value: str) -> str:
+        base = "|".join(
+            [
+                event.event_type,
+                alias_type,
+                event.hostname,
+                value.lower(),
+                self.logout_timestamp_bucket(event),
+            ]
+        )
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+    def logout_source_alias_value(self, event: SSHEvent) -> str:
+        if event.source_ip == UNKNOWN_VALUE:
+            return UNKNOWN_VALUE
+        if event.source_port:
+            return f"{event.source_ip}:{event.source_port}"
+        return event.source_ip
+
+    def dedupe_lookup_fingerprints(self, event: SSHEvent) -> list[str]:
+        if event.event_type != "logout":
+            return [event.fingerprint()]
+
+        fingerprints = [self.normalized_fingerprint(event)]
+        if event.process_id:
+            fingerprints.append(self.logout_alias_fingerprint(event, "process", event.process_id))
+
+        has_username = event.username != UNKNOWN_VALUE
+        has_source_ip = event.source_ip != UNKNOWN_VALUE
+        is_full_logout = has_username and has_source_ip
+        source_alias_value = self.logout_source_alias_value(event)
+
+        if has_username:
+            fingerprints.append(
+                self.logout_alias_fingerprint(event, "partial-user", event.username)
+            )
+            if not is_full_logout:
+                fingerprints.append(
+                    self.logout_alias_fingerprint(event, "full-user", event.username)
+                )
+        if has_source_ip:
+            fingerprints.append(
+                self.logout_alias_fingerprint(event, "partial-source", source_alias_value)
+            )
+            if not is_full_logout:
+                fingerprints.append(
+                    self.logout_alias_fingerprint(event, "full-source", source_alias_value)
+                )
+
+        return list(dict.fromkeys(fingerprints))
+
+    def dedupe_mark_fingerprints(self, event: SSHEvent) -> list[str]:
+        if event.event_type != "logout":
+            return [event.fingerprint()]
+
+        fingerprints = [self.normalized_fingerprint(event)]
+        if event.process_id:
+            fingerprints.append(self.logout_alias_fingerprint(event, "process", event.process_id))
+
+        has_username = event.username != UNKNOWN_VALUE
+        has_source_ip = event.source_ip != UNKNOWN_VALUE
+        alias_prefix = "full" if has_username and has_source_ip else "partial"
+        source_alias_value = self.logout_source_alias_value(event)
+
+        if has_username:
+            fingerprints.append(
+                self.logout_alias_fingerprint(event, f"{alias_prefix}-user", event.username)
+            )
+        if has_source_ip:
+            fingerprints.append(
+                self.logout_alias_fingerprint(
+                    event,
+                    f"{alias_prefix}-source",
+                    source_alias_value,
+                )
+            )
+
+        return list(dict.fromkeys(fingerprints))
+
+    def logout_events_match(self, first: SSHEvent, second: SSHEvent) -> bool:
+        if first.hostname != second.hostname:
+            return False
+        if self.logout_timestamp_bucket(first) != self.logout_timestamp_bucket(second):
+            return False
+        if first.process_id and second.process_id and first.process_id == second.process_id:
+            return True
+
+        first_has_username = first.username != UNKNOWN_VALUE
+        second_has_username = second.username != UNKNOWN_VALUE
+        first_has_ip = first.source_ip != UNKNOWN_VALUE
+        second_has_ip = second.source_ip != UNKNOWN_VALUE
+
+        first_is_full = first_has_username and first_has_ip
+        second_is_full = second_has_username and second_has_ip
+
+        if first_has_ip and second_has_ip and first.source_ip == second.source_ip:
+            if first.source_port and second.source_port:
+                return first.source_port == second.source_port
+            if first.source_port or second.source_port:
+                return False
+
+        if first_is_full and second_is_full:
+            return first.username == second.username and first.source_ip == second.source_ip
+
+        if first_has_username and second_has_username and first.username == second.username:
+            return True
+        if first_has_ip and second_has_ip and first.source_ip == second.source_ip:
+            return True
+        return False
+
+    def merge_logout_events(self, events: list[SSHEvent]) -> SSHEvent:
+        best_event = max(
+            events,
+            key=lambda event: (
+                event.username != UNKNOWN_VALUE,
+                event.source_ip != UNKNOWN_VALUE,
+                bool(event.process_id),
+            ),
+        )
+        username = next(
+            (event.username for event in events if event.username != UNKNOWN_VALUE),
+            UNKNOWN_VALUE,
+        )
+        source_ip = next(
+            (event.source_ip for event in events if event.source_ip != UNKNOWN_VALUE),
+            UNKNOWN_VALUE,
+        )
+        process_id = next((event.process_id for event in events if event.process_id), "")
+        source_port = next((event.source_port for event in events if event.source_port), "")
+
+        return SSHEvent(
+            event_type=best_event.event_type,
+            severity=best_event.severity,
+            timestamp=best_event.timestamp,
+            hostname=best_event.hostname,
+            username=username,
+            source_ip=source_ip,
+            raw_message=best_event.raw_message,
+            source_name=best_event.source_name,
+            process_id=process_id,
+            source_port=source_port,
+        )
+
+    def coalesce_logout_events(
+        self,
+        records: list[tuple[SSHEvent, float]],
+    ) -> list[tuple[SSHEvent, float]]:
+        logout_indexes = [
+            index for index, (event, _) in enumerate(records) if event.event_type == "logout"
+        ]
+        if len(logout_indexes) < 2:
+            return records
+
+        parents = {index: index for index in logout_indexes}
+
+        def find(index: int) -> int:
+            parent = parents[index]
+            if parent != index:
+                parents[index] = find(parent)
+            return parents[index]
+
+        def union(first: int, second: int) -> None:
+            first_parent = find(first)
+            second_parent = find(second)
+            if first_parent != second_parent:
+                parents[second_parent] = first_parent
+
+        for position, first_index in enumerate(logout_indexes):
+            first_event = records[first_index][0]
+            for second_index in logout_indexes[position + 1 :]:
+                second_event = records[second_index][0]
+                if self.logout_events_match(first_event, second_event):
+                    union(first_index, second_index)
+
+        grouped_indexes: dict[int, list[int]] = defaultdict(list)
+        for index in logout_indexes:
+            grouped_indexes[find(index)].append(index)
+
+        replacements: dict[int, tuple[SSHEvent, float]] = {}
+        skipped_indexes: set[int] = set()
+        for indexes in grouped_indexes.values():
+            if len(indexes) < 2:
+                continue
+            first_index = min(indexes)
+            events = [records[index][0] for index in indexes]
+            merged_event = self.merge_logout_events(events)
+            latest_now = max(records[index][1] for index in indexes)
+            replacements[first_index] = (merged_event, latest_now)
+            skipped_indexes.update(index for index in indexes if index != first_index)
+
+        if not replacements:
+            return records
+
+        coalesced: list[tuple[SSHEvent, float]] = []
+        for index, record in enumerate(records):
+            if index in skipped_indexes:
+                continue
+            coalesced.append(replacements.get(index, record))
+        return coalesced
 
     def prepare_event(self, event: SSHEvent, now: float) -> SSHEvent:
         if event.event_type == "login_success":
@@ -484,7 +704,7 @@ class SSHWatcher:
         return None
 
     def process_lines(self, lines: list[str]) -> int:
-        processed = 0
+        records: list[tuple[SSHEvent, float]] = []
         for line in lines:
             event = parse_ssh_event(line, self.settings, self.source.describe())
             if event is None:
@@ -492,6 +712,13 @@ class SSHWatcher:
 
             now = time.time()
             event = self.prepare_event(event, now)
+            records.append((event, now))
+
+        records = self.coalesce_logout_events(records)
+
+        processed = 0
+        state_changed = False
+        for event, now in records:
 
             if self.should_ignore(event):
                 self.logger.debug(
@@ -501,9 +728,24 @@ class SSHWatcher:
                 )
                 continue
 
-            fingerprint = self.normalized_fingerprint(event)
-            if self.state_store.seen_recently(fingerprint, self.settings.dedupe_ttl, now):
-                self.logger.debug("Evento duplicado suprimido: %s", fingerprint)
+            lookup_fingerprints = self.dedupe_lookup_fingerprints(event)
+            duplicate_fingerprint = next(
+                (
+                    fingerprint
+                    for fingerprint in lookup_fingerprints
+                    if self.state_store.seen_recently(
+                        fingerprint,
+                        self.settings.dedupe_ttl,
+                        now,
+                    )
+                ),
+                None,
+            )
+            if duplicate_fingerprint is not None:
+                for fingerprint in self.dedupe_mark_fingerprints(event):
+                    self.state_store.mark_seen(fingerprint, now)
+                state_changed = True
+                self.logger.debug("Evento duplicado suprimido: %s", duplicate_fingerprint)
                 continue
 
             rate_key = f"{event.event_type}:{event.username}:{event.source_ip}"
@@ -512,11 +754,13 @@ class SSHWatcher:
                 continue
 
             self.emit(event)
-            self.state_store.mark_seen(fingerprint, now)
+            for fingerprint in self.dedupe_mark_fingerprints(event):
+                self.state_store.mark_seen(fingerprint, now)
+            state_changed = True
             self.finalize_event(event)
             processed += 1
 
-        if processed:
+        if state_changed:
             self.state_store.save()
         return processed
 
